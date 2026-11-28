@@ -852,6 +852,16 @@ func (p *PeerPool) Peers() []*PeerClient {
 	return result
 }
 
+// peerHealth returns pc's Healthy verdict and LastSeenAt as one pair. Discovery
+// writes both under p.mu, so reading them under the same lock never pairs one
+// tick's verdict with another tick's timestamp. ListBackends derives healthy,
+// unhealthy_reason and last_seen_at from this pair (#3722).
+func (p *PeerPool) peerHealth(pc *PeerClient) (healthy bool, lastSeen time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return pc.Healthy, pc.LastSeenAt
+}
+
 // HealthyPeersInPool returns healthy peers tagged with the given pool.
 // An empty pool argument matches peers whose Pool tag is also empty
 // (legacy untagged behavior).

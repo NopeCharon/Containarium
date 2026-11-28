@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -123,6 +124,91 @@ func TestContainerServer_ListBackends_UnhealthyReason(t *testing.T) {
 					localHealthy, b.Id, b.Healthy, b.UnhealthyReason, w.healthy, w.reason)
 			}
 			assertHealthInvariant(t, b.Id, b.Healthy, b.UnhealthyReason)
+		}
+	}
+}
+
+// TestContainerServer_ListBackends_PeerHealthReadUnderPoolLock lists backends
+// while a writer keeps changing a peer's health the way discover() writes it:
+// under the pool lock, Healthy first and then LastSeenAt when healthy. Every
+// listing must describe one discovery result: a healthy peer has a last-seen
+// time, and an unhealthy one is NEVER_SEEN exactly when it has none. Under
+// -race (the server-race lane) it also fails if ListBackends reads the pair
+// without the lock.
+func TestContainerServer_ListBackends_PeerHealthReadUnderPoolLock(t *testing.T) {
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"info":{}}`))
+	}))
+	defer peerSrv.Close()
+
+	pool := NewPeerPool("local-spot", "", nil, "")
+	flap := &PeerClient{
+		ID:     "tunnel-flap",
+		Addr:   peerSrv.Listener.Addr().String(),
+		client: peerSrv.Client(),
+	}
+	pool.mu.Lock()
+	pool.peers[flap.ID] = flap
+	pool.mu.Unlock()
+
+	s := &ContainerServer{
+		peerPool:           pool,
+		localHealthCheckFn: func() bool { return true },
+	}
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	// The start barrier makes the writer and the listings overlap; stop keeps
+	// the writer flipping until the last listing is done.
+	start, stop := make(chan struct{}), make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			pool.mu.Lock()
+			flap.Healthy = !flap.Healthy
+			if flap.Healthy {
+				flap.LastSeenAt = time.Now()
+			}
+			pool.mu.Unlock()
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	close(start)
+	for i := 0; i < 200; i++ {
+		resp, err := s.ListBackends(ctx, &pb.ListBackendsRequest{})
+		if err != nil {
+			t.Fatalf("ListBackends: %v", err)
+		}
+		found := false
+		for _, b := range resp.Backends {
+			if b.Id != flap.ID {
+				continue
+			}
+			found = true
+			if b.Healthy && b.LastSeenAt == "" {
+				t.Fatalf("listing %d: healthy peer has no last_seen_at", i)
+			}
+			neverSeen := b.UnhealthyReason == pb.BackendUnhealthyReason_BACKEND_UNHEALTHY_REASON_NEVER_SEEN
+			if !b.Healthy && neverSeen != (b.LastSeenAt == "") {
+				t.Fatalf("listing %d: unhealthy_reason %s with last_seen_at %q; want NEVER_SEEN exactly when last_seen_at is empty",
+					i, b.UnhealthyReason, b.LastSeenAt)
+			}
+			assertHealthInvariant(t, b.Id, b.Healthy, b.UnhealthyReason)
+		}
+		if !found {
+			t.Fatalf("listing %d: %s is missing", i, flap.ID)
 		}
 	}
 }

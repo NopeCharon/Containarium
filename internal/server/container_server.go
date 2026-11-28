@@ -3859,9 +3859,10 @@ func (s *ContainerServer) ListBackends(ctx context.Context, _ *pb.ListBackendsRe
 	peerInfos := make([]*pb.BackendInfo, len(peers))
 	var wg sync.WaitGroup
 	for i, peer := range peers {
-		// Read health and last-seen once, so healthy, unhealthy_reason
-		// (#3722) and last_seen_at describe the same discovery result.
-		healthy, lastSeen := peer.Healthy, peer.LastSeenAt
+		// Read health and last-seen once, under the pool lock, so healthy,
+		// unhealthy_reason (#3722) and last_seen_at describe the same
+		// discovery result.
+		healthy, lastSeen := s.peerPool.peerHealth(peer)
 		pi := &pb.BackendInfo{
 			Id:              peer.ID,
 			Type:            "tunnel",
